@@ -1,0 +1,162 @@
+import json
+import subprocess
+
+
+POWERSHELL_SCRIPT = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$xpath = "*[System[(EventID=4624)]] and *[EventData[(Data[@Name='LogonType']='2' or Data[@Name='LogonType']='7' or Data[@Name='LogonType']='10' or Data[@Name='LogonType']='11')]]"
+
+$events = Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 20 -ErrorAction Stop
+
+$result = foreach ($event in $events) {
+    $eventXml = [xml]$event.ToXml()
+    $eventData = @{}
+
+    foreach ($item in $eventXml.Event.EventData.Data) {
+        $eventData[$item.Name] = $item.'#text'
+    }
+
+    [PSCustomObject]@{
+        TimeCreated = $event.TimeCreated.ToString(
+            'yyyy-MM-dd HH:mm:ss'
+        )
+        UserName    = $eventData['TargetUserName']
+        LogonType   = $eventData['LogonType']
+        SourceIP    = $eventData['IpAddress']
+        ProcessName = $eventData['ProcessName']
+    }
+}
+
+ConvertTo-Json -InputObject @($result) -Compress
+"""
+
+
+LOGON_TYPE_NAMES = {
+    "2": "本机登录",
+    "7": "电脑解锁",
+    "10": "远程桌面",
+    "11": "缓存凭据登录"
+}
+
+TRUSTED_ACCOUNTS = {"李童尧"}
+
+
+def get_login_events():
+    """读取Windows登录事件。"""
+
+    print("正在读取Windows登录日志，请稍候……", flush=True)
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            POWERSHELL_SCRIPT
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30
+    )
+
+    if result.returncode != 0:
+        error_message = result.stderr.strip()
+
+        if not error_message:
+            error_message = "未知的PowerShell错误"
+
+        raise RuntimeError(error_message)
+
+    output = result.stdout.lstrip("\ufeff").strip()
+
+    if not output:
+        return []
+
+    return json.loads(output)
+
+
+def is_system_account(user_name):
+    """判断是否为Windows图形系统账户。"""
+
+    system_prefixes = ("DWM-", "UMFD-")
+    return user_name.startswith(system_prefixes)
+
+
+def display_login_events(events):
+    """整理并显示登录事件。"""
+
+    print("\n===== 登录痕迹检查 =====")
+
+    if not events:
+        print("没有读取到符合条件的登录记录。")
+        return
+
+    seen_events = set()
+    review_count = 0
+
+    for event in events:
+        user_name = event.get("UserName") or "-"
+        logon_type = str(event.get("LogonType") or "-")
+        time_created = event.get("TimeCreated") or "-"
+        source_ip = event.get("SourceIP") or "-"
+        process_name = event.get("ProcessName") or "-"
+
+        event_key = (
+            time_created,
+            user_name,
+            logon_type,
+            source_ip
+        )
+
+        if event_key in seen_events:
+            continue
+
+        seen_events.add(event_key)
+
+        type_name = LOGON_TYPE_NAMES.get(
+            logon_type,
+            "其他登录"
+        )
+
+        if logon_type == "10":
+            status = "远程登录，重点确认"
+            review_count += 1
+
+        elif is_system_account(user_name):
+            status = "系统会话"
+
+        elif user_name in TRUSTED_ACCOUNTS:
+            status = "本人账户"
+
+        else:
+            status = "需要确认"
+            review_count += 1
+
+        print(f"\n时间：{time_created}")
+        print(f"账户：{user_name}")
+        print(f"类型：{type_name}")
+        print(f"来源：{source_ip}")
+        print(f"进程：{process_name}")
+        print(f"判断：{status}")
+
+    print("\n===== 登录检查结果 =====")
+    print(f"需要确认的记录：{review_count} 条")
+
+
+if __name__ == "__main__":
+    try:
+        login_events = get_login_events()
+        display_login_events(login_events)
+
+    except subprocess.TimeoutExpired:
+        print("读取日志超过30秒，程序已停止。")
+
+    except json.JSONDecodeError as error:
+        print("PowerShell返回的数据格式不正确。")
+        print(f"错误信息：{error}")
+
+    except RuntimeError as error:
+        print("登录日志读取失败。")
+        print("请确认当前PowerShell具有管理员权限。")
+        print(f"错误信息：{error}")
